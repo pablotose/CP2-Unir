@@ -1,0 +1,165 @@
+---
+- name: Build and push cp2-pablotoledo-nginx image to ACR
+  hosts: testserver
+  gather_facts: false
+
+  vars:
+    acr_name: "acrcp2pablo2026"
+    acr_login_server: "acrcp2pablo2026.azurecr.io"
+    image_name: "cp2-pablotoledo-nginx"
+    image_tag: "cp2-nginx"
+    local_image: "{{ image_name }}:{{ image_tag }}"
+    remote_image: "{{ acr_login_server }}/{{ image_name }}:{{ image_tag }}"
+    app_dir: "{{ playbook_dir }}/../images/vm_nginx"
+
+  tasks:
+    - name: Get ACR username
+      ansible.builtin.command:
+        cmd: az acr credential show -n {{ acr_name }} --query username -o tsv
+      register: acr_username_cmd
+      changed_when: false
+
+    - name: Get ACR password
+      ansible.builtin.command:
+        cmd: az acr credential show -n {{ acr_name }} --query passwords[0].value -o tsv
+      register: acr_password_cmd
+      changed_when: false
+
+    - name: Build local Podman image
+      ansible.builtin.command:
+        cmd: podman build -t {{ local_image }} .
+        chdir: "{{ app_dir }}"
+      changed_when: true
+
+    - name: Login to ACR from control node
+      ansible.builtin.command:
+        cmd: podman login {{ acr_login_server }} -u {{ acr_username_cmd.stdout }} -p {{ acr_password_cmd.stdout }}
+      changed_when: true
+
+    - name: Tag image for ACR
+      ansible.builtin.command:
+        cmd: podman tag {{ local_image }} {{ remote_image }}
+      changed_when: true
+
+    - name: Push image to ACR
+      ansible.builtin.command:
+        cmd: podman push {{ remote_image }}
+      changed_when: true
+
+- name: Deploy cp2-pablotoledo-nginx container on Azure VM
+  hosts: azure
+  become: true
+
+  vars:
+    acr_name: "acrcp2pablo2026"
+    acr_login_server: "acrcp2pablo2026.azurecr.io"
+    image_name: "cp2-pablotoledo-nginx"
+    image_tag: "cp2-nginx"
+    remote_image: "{{ acr_login_server }}/{{ image_name }}:{{ image_tag }}"
+    container_name: "cp2-pablotoledo-nginx"
+    host_port: "8443"
+    container_port: "443"
+    systemd_unit_name: "container-{{ container_name }}.service"
+
+  tasks:
+    - name: Update apt cache
+      ansible.builtin.apt:
+        update_cache: true
+
+    - name: Install Podman
+      ansible.builtin.apt:
+        name: podman
+        state: present
+
+    - name: Get ACR username
+      ansible.builtin.command:
+        cmd: az acr credential show -n {{ acr_name }} --query username -o tsv
+      delegate_to: localhost
+      register: acr_username_cmd
+      changed_when: false
+      become: false
+
+    - name: Get ACR password
+      ansible.builtin.command:
+        cmd: az acr credential show -n {{ acr_name }} --query passwords[0].value -o tsv
+      delegate_to: localhost
+      register: acr_password_cmd
+      changed_when: false
+      become: false
+
+    - name: Login to ACR from Azure VM
+      ansible.builtin.command:
+        cmd: podman login {{ acr_login_server }} -u {{ acr_username_cmd.stdout }} -p {{ acr_password_cmd.stdout }}
+      changed_when: true
+
+    - name: Stop existing systemd service if present
+      ansible.builtin.systemd:
+        name: "{{ systemd_unit_name }}"
+        state: stopped
+      ignore_errors: true
+
+    - name: Disable existing systemd service if present
+      ansible.builtin.systemd:
+        name: "{{ systemd_unit_name }}"
+        enabled: false
+      ignore_errors: true
+
+    - name: Stop existing container if present
+      ansible.builtin.command:
+        cmd: podman stop {{ container_name }}
+      ignore_errors: true
+      changed_when: true
+
+    - name: Remove existing container if present
+      ansible.builtin.command:
+        cmd: podman rm {{ container_name }}
+      ignore_errors: true
+      changed_when: true
+
+    - name: Pull image from ACR
+      ansible.builtin.command:
+        cmd: podman pull {{ remote_image }}
+      changed_when: true
+
+    - name: Run container from ACR image
+      ansible.builtin.command:
+        cmd: >
+          podman run -d
+          --name {{ container_name }}
+          -p {{ host_port }}:{{ container_port }}
+          {{ remote_image }}
+      changed_when: true
+
+    - name: Remove old generated unit in /tmp if present
+      ansible.builtin.file:
+        path: "/tmp/{{ systemd_unit_name }}"
+        state: absent
+
+    - name: Generate systemd unit file
+      ansible.builtin.command:
+        cmd: podman generate systemd --name {{ container_name }} --files --new
+        chdir: /tmp
+      changed_when: true
+
+    - name: Copy generated systemd unit
+      ansible.builtin.copy:
+        src: "/tmp/{{ systemd_unit_name }}"
+        dest: "/etc/systemd/system/{{ systemd_unit_name }}"
+        remote_src: true
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: Reload systemd
+      ansible.builtin.systemd:
+        daemon_reload: true
+
+    - name: Enable container service
+      ansible.builtin.systemd:
+        name: "{{ systemd_unit_name }}"
+        enabled: true
+
+    - name: Restart container service
+      ansible.builtin.systemd:
+        name: "{{ systemd_unit_name }}"
+        state: restarted

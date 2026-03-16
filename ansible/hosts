@@ -1,0 +1,5 @@
+[testserver]
+localhost ansible_connection=local ansible_python_interpreter=/home/pablo/devops-cp2/ansible/.venv/bin/python
+
+[azure]
+azurevm ansible_host=51.103.99.225 ansible_user=devops

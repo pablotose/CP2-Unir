@@ -1,0 +1,139 @@
+---
+- name: Build and push AKS Apache image to ACR
+  hosts: testserver
+  gather_facts: false
+
+  vars:
+    acr_name: "acrcp2pablo2026"
+    acr_login_server: "acrcp2pablo2026.azurecr.io"
+    image_name: "cp2-pablotoledo-aks-apache"
+    image_tag: "cp2-apache"
+    local_image: "{{ image_name }}:{{ image_tag }}"
+    remote_image: "{{ acr_login_server }}/{{ image_name }}:{{ image_tag }}"
+    app_dir: "{{ playbook_dir }}/../images/aks_apache"
+
+  tasks:
+    - name: Get ACR username
+      ansible.builtin.command:
+        cmd: az acr credential show -n {{ acr_name }} --query username -o tsv
+      register: acr_username_cmd
+      changed_when: false
+
+    - name: Get ACR password
+      ansible.builtin.command:
+        cmd: az acr credential show -n {{ acr_name }} --query passwords[0].value -o tsv
+      register: acr_password_cmd
+      changed_when: false
+
+    - name: Build Apache image for AKS
+      ansible.builtin.command:
+        cmd: podman build -t {{ local_image }} .
+        chdir: "{{ app_dir }}"
+      changed_when: true
+
+    - name: Login to ACR from control node
+      ansible.builtin.command:
+        cmd: podman login {{ acr_login_server }} -u {{ acr_username_cmd.stdout }} -p {{ acr_password_cmd.stdout }}
+      changed_when: true
+
+    - name: Tag Apache image for ACR
+      ansible.builtin.command:
+        cmd: podman tag {{ local_image }} {{ remote_image }}
+      changed_when: true
+
+    - name: Push Apache image to ACR
+      ansible.builtin.command:
+        cmd: podman push {{ remote_image }}
+      changed_when: true
+
+    - name: Verify Apache image tag exists in ACR
+      ansible.builtin.command:
+        cmd: az acr repository show-tags -n {{ acr_name }} --repository {{ image_name }} --query "[?@=='{{ image_tag }}'] | [0]" -o tsv
+      register: acr_tag_check
+      changed_when: false
+      failed_when: acr_tag_check.stdout != image_tag
+
+- name: Deploy Apache application on AKS
+  hosts: testserver
+  gather_facts: false
+
+  vars:
+    resource_group: "rg-cp2-devops"
+    aks_name: "aks-cp2-pablo"
+    namespace: "default"
+    acr_login_server: "acrcp2pablo2026.azurecr.io"
+    image_name: "cp2-pablotoledo-aks-apache"
+    image_tag: "cp2-apache"
+    remote_image: "{{ acr_login_server }}/{{ image_name }}:{{ image_tag }}"
+
+  tasks:
+    - name: Get AKS credentials
+      ansible.builtin.command:
+        cmd: az aks get-credentials --resource-group {{ resource_group }} --name {{ aks_name }} --overwrite-existing
+      changed_when: true
+
+    - name: Create PersistentVolumeClaim
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: PersistentVolumeClaim
+          metadata:
+            name: cp2-apache-pvc
+            namespace: "{{ namespace }}"
+          spec:
+            accessModes:
+              - ReadWriteOnce
+            resources:
+              requests:
+                storage: 1Gi
+
+    - name: Create Apache Deployment
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: cp2-apache-deployment
+            namespace: "{{ namespace }}"
+          spec:
+            replicas: 1
+            selector:
+              matchLabels:
+                app: cp2-apache
+            template:
+              metadata:
+                labels:
+                  app: cp2-apache
+              spec:
+                containers:
+                  - name: cp2-apache
+                    image: "{{ remote_image }}"
+                    ports:
+                      - containerPort: 80
+                    volumeMounts:
+                      - mountPath: /usr/local/apache2/htdocs/data
+                        name: cp2-storage
+                volumes:
+                  - name: cp2-storage
+                    persistentVolumeClaim:
+                      claimName: cp2-apache-pvc
+
+    - name: Create Apache Service
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: cp2-apache-service
+            namespace: "{{ namespace }}"
+          spec:
+            type: LoadBalancer
+            selector:
+              app: cp2-apache
+            ports:
+              - protocol: TCP
+                port: 80
+                targetPort: 80
